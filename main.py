@@ -15,7 +15,7 @@ def read_root():
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="google-site-verification" content="TdDLxgeU7UAdSM2IaMOAznO2yIV9S9i1VzbuTidmcGk" />
         <title>TechHub: SQL Optimizer & Global Search</title>
         <style>
             body { font-family: 'Segoe UI', sans-serif; background-color: #f4f6f9; margin: 0; padding: 0; }

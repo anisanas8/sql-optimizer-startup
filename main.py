@@ -125,14 +125,20 @@ def optimize_endpoint(input_data: QueryInput):
                 is_optimized = False
                 suggestions.append(f"❌ Anti-Pattern: Found function '{func}' inside the WHERE clause. This forces full-table scans by breaking index lookups.")
 
-    # Rule 3: Robust Leading Wildcard Check
-    if "LIKE" in query_upper:
-        like_parts = query_upper.split("LIKE")[1:]
-        for part in like_parts:
-            clean_part = part.strip().replace("'", "").replace('"', "")
-            if clean_part.startswith("%"):
-                is_optimized = False
-                suggestions.append("❌ Anti-Pattern: Leading wildcard ('%value') detected in LIKE clause. The database engine cannot use standard B-Tree indexes. Suggestion: Use full-text search indexing.")
+    # Rule 3: Detect old-school comma joins
+    if "FROM" in query_upper:
+        # Safely get everything after FROM
+        after_from = query_upper.split("FROM")[1]
+        
+        # If there is a WHERE clause, only look at text BEFORE the WHERE clause
+        if "WHERE" in after_from:
+            from_part = after_from.split("WHERE")[0]
+        else:
+            from_part = after_from
+
+        if "," in from_part:
+            is_optimized = False
+            suggestions.append("❌ Anti-Pattern: Using commas ',' to join tables. Use explicit 'JOIN' syntax for better performance.")
 
     return {
         "status": "Perfect" if is_optimized else "Needs Optimization",

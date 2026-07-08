@@ -1,14 +1,90 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-import sqlparse
 import re
-
+from typing import List, Optional
+ 
+import sqlparse
+from sqlparse.sql import Where
+from sqlparse.tokens import Keyword, DML
+ 
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+ 
 app = FastAPI(title="AI SQL Performance Optimizer")
-
+ 
+ 
 class QueryInput(BaseModel):
-    sql: str
-
+    sql: str = Field(..., min_length=1, description="Raw SQL query to analyze")
+ 
+ 
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+ 
+CLAUSE_STOP_KEYWORDS = {
+    "WHERE", "GROUP BY", "ORDER BY", "HAVING", "LIMIT", "UNION",
+    "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN",
+    "LEFT OUTER JOIN", "RIGHT OUTER JOIN",
+}
+ 
+ 
+def split_top_level(text: str, sep: str = ",") -> List[str]:
+    """Split `text` on `sep`, but only at paren-depth 0, so commas inside
+    function calls / subqueries / IN (...) lists are not treated as
+    top-level separators."""
+    parts, current, depth = [], "", 0
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == sep and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+    parts.append(current)
+    return [p.strip() for p in parts if p.strip()]
+ 
+ 
+def get_where_clause(statement) -> Optional[str]:
+    """Return the text of the top-level WHERE clause (including the WHERE
+    keyword), or None if there isn't one. Uses sqlparse's grouping, so it
+    won't get confused by WHERE keywords inside subqueries."""
+    for token in statement.tokens:
+        if isinstance(token, Where):
+            return str(token)
+    return None
+ 
+ 
+def get_from_clause(statement) -> Optional[str]:
+    """Return the text between the top-level FROM keyword and the next
+    clause boundary (WHERE / JOIN / GROUP BY / ... / end of statement)."""
+    tokens = [t for t in statement.flatten()] if False else list(statement.tokens)
+    collecting = False
+    collected = []
+    for token in tokens:
+        val_upper = token.value.strip().upper() if token.value else ""
+        if not collecting:
+            if token.ttype is Keyword and val_upper == "FROM":
+                collecting = True
+            continue
+        # Stop at the next clause-level keyword (JOIN, WHERE, GROUP BY, ...)
+        if (token.ttype is Keyword or isinstance(token, Where)) and any(
+            val_upper == kw or val_upper.startswith(kw + " ") for kw in CLAUSE_STOP_KEYWORDS
+        ):
+            break
+        if isinstance(token, Where):
+            break
+        collected.append(str(token))
+    if not collecting:
+        return None
+    return "".join(collected).strip() or None
+ 
+ 
+# --------------------------------------------------------------------------
+# Frontend (unchanged design, only the JS/CSS from the original)
+# --------------------------------------------------------------------------
+ 
 @app.get("/", response_class=HTMLResponse)
 def read_root():
     return """
@@ -29,19 +105,19 @@ def read_root():
                 --success: #10b981;
                 --danger: #ef4444;
             }
-            body { 
-                font-family: 'Inter', system-ui, -apple-system, sans-serif; 
-                background-color: var(--bg-primary); 
+            body {
+                font-family: 'Inter', system-ui, -apple-system, sans-serif;
+                background-color: var(--bg-primary);
                 color: var(--text-main);
-                margin: 0; 
-                padding: 0; 
+                margin: 0;
+                padding: 0;
             }
             .header {
                 text-align: center;
                 padding: 40px 20px;
                 background: linear-gradient(180deg, rgba(59,130,246,0.1) 0%, rgba(15,23,42,0) 100%);
             }
-            .header h1 { margin: 0; font-size: 2.5rem; font-weight: 800; tracking-tight: -0.05em; }
+            .header h1 { margin: 0; font-size: 2.5rem; font-weight: 800; }
             .header p { color: var(--text-muted); margin-top: 10px; font-size: 1.1rem; }
             .main-layout {
                 max-width: 1200px;
@@ -98,7 +174,8 @@ def read_root():
                 margin-top: 16px;
                 transition: background 0.2s;
             }
-            .btn:hover { background-color: var(--accent-hover); }
+            .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+            .btn:hover:not(:disabled) { background-color: var(--accent-hover); }
             .output-pane {
                 height: 200px;
                 background-color: #0b0f19;
@@ -122,6 +199,7 @@ def read_root():
             }
             .status-perfect { background-color: rgba(16,185,129,0.15); color: var(--success); border: 1px solid rgba(16,185,129,0.3); }
             .status-warn { background-color: rgba(239,68,68,0.15); color: var(--danger); border: 1px solid rgba(239,68,68,0.3); }
+            .status-error { background-color: rgba(239,68,68,0.25); color: #fecaca; border: 1px solid rgba(239,68,68,0.5); }
             .warnings-list {
                 padding-left: 20px;
                 margin: 0;
@@ -133,141 +211,226 @@ def read_root():
         </style>
     </head>
     <body>
-
+ 
         <div class="header">
             <h1>⚡ SQL Optimizer Pro</h1>
             <p>Paste your raw query to analyze architectural index breaks and get auto-optimized alternatives.</p>
         </div>
-
+ 
         <div class="main-layout">
             <div class="card">
                 <div class="card-title">💻 Enter Raw SQL Query</div>
                 <textarea id="sqlQuery" placeholder="SELECT * FROM users, orders WHERE users.id = orders.user_id AND LOWER(name) = 'anas';"></textarea>
-                <button class="btn" onclick="processQuery()">Optimize Architecture</button>
+                <button class="btn" id="optimizeBtn" onclick="processQuery()">Optimize Architecture</button>
             </div>
-
+ 
             <div class="card" id="resultsCard" style="opacity: 0.4; pointer-events: none;">
                 <div class="card-title">🔍 Optimization Intelligence</div>
                 <div id="statusIndicator"></div>
-                
+ 
                 <div style="margin-bottom: 20px;">
                     <div style="font-weight: 600; margin-bottom: 8px; font-size: 0.9rem; color: var(--text-muted);">ANALYSIS REPORT:</div>
                     <ul id="warningsDisplay" class="warnings-list"></ul>
                 </div>
-
+ 
                 <div style="flex-grow: 1; display: flex; flex-direction: column;">
-                    <div style="font-weight: 600; margin-bottom: 8px; font-size: 0.9rem; color: var(--text-muted);">RECOMMENDED PERFECT REWRITE:</div>
+                    <div style="font-weight: 600; margin-bottom: 8px; font-size: 0.9rem; color: var(--text-muted);">RECOMMENDED REWRITE:</div>
                     <div id="fixedQueryDisplay" class="output-pane">Your clean query layout will compile here...</div>
                 </div>
             </div>
         </div>
-
+ 
         <script>
             async function processQuery() {
                 const sqlText = document.getElementById('sqlQuery').value;
                 if(!sqlText.trim()) return alert("Please type an SQL query first!");
-
-                const response = await fetch('/optimize', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sql: sqlText })
-                });
-                const data = await response.json();
-                
-                // Unlock results pane
+ 
+                const btn = document.getElementById('optimizeBtn');
+                btn.disabled = true;
+                btn.innerText = "Analyzing...";
+ 
                 const resultsCard = document.getElementById('resultsCard');
-                resultsCard.style.opacity = "1";
-                resultsCard.style.pointerEvents = "auto";
-
                 const statusIndicator = document.getElementById('statusIndicator');
                 const warningsDisplay = document.getElementById('warningsDisplay');
                 const fixedQueryDisplay = document.getElementById('fixedQueryDisplay');
-
-                warningsDisplay.innerHTML = "";
-
-                if(data.status === "Needs Optimization") {
-                    statusIndicator.className = "status-badge status-warn";
-                    statusIndicator.innerText = "⚠️ DEGRADED ARCHITECTURE DETECTED";
-                    
-                    data.suggestions.forEach(item => {
-                        const li = document.createElement('li');
-                        li.innerText = item;
-                        warningsDisplay.appendChild(li);
+ 
+                try {
+                    const response = await fetch('/optimize', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ sql: sqlText })
                     });
-                    
-                    fixedQueryDisplay.innerText = data.fixed_sql;
-                    fixedQueryDisplay.style.color = "#a7f3d0";
-                } else {
-                    statusIndicator.className = "status-badge status-perfect";
-                    statusIndicator.innerText = "✅ EXCELLENT PRODUCTION ARCHITECTURE";
-                    
-                    const li = document.createElement('li');
-                    li.innerText = "No anti-patterns matched. High-performance structures verified.";
-                    warningsDisplay.appendChild(li);
-                    
-                    fixedQueryDisplay.innerText = sqlText;
-                    fixedQueryDisplay.style.color = "#38bdf8";
+ 
+                    resultsCard.style.opacity = "1";
+                    resultsCard.style.pointerEvents = "auto";
+                    warningsDisplay.innerHTML = "";
+ 
+                    if (!response.ok) {
+                        const err = await response.json().catch(() => ({detail: "Unknown error"}));
+                        statusIndicator.className = "status-badge status-error";
+                        statusIndicator.innerText = "❌ COULD NOT PARSE QUERY";
+                        const li = document.createElement('li');
+                        li.innerText = err.detail || "The query could not be analyzed.";
+                        warningsDisplay.appendChild(li);
+                        fixedQueryDisplay.innerText = "";
+                        return;
+                    }
+ 
+                    const data = await response.json();
+ 
+                    if(data.status === "Needs Optimization") {
+                        statusIndicator.className = "status-badge status-warn";
+                        statusIndicator.innerText = "⚠️ DEGRADED ARCHITECTURE DETECTED";
+ 
+                        data.suggestions.forEach(item => {
+                            const li = document.createElement('li');
+                            li.innerText = item;
+                            warningsDisplay.appendChild(li);
+                        });
+ 
+                        fixedQueryDisplay.innerText = data.fixed_sql;
+                        fixedQueryDisplay.style.color = "#a7f3d0";
+                    } else {
+                        statusIndicator.className = "status-badge status-perfect";
+                        statusIndicator.innerText = "✅ NO ANTI-PATTERNS DETECTED";
+ 
+                        const li = document.createElement('li');
+                        li.innerText = "No anti-patterns matched by current rule set.";
+                        warningsDisplay.appendChild(li);
+ 
+                        fixedQueryDisplay.innerText = sqlText;
+                        fixedQueryDisplay.style.color = "#38bdf8";
+                    }
+                } catch (e) {
+                    statusIndicator.className = "status-badge status-error";
+                    statusIndicator.innerText = "❌ REQUEST FAILED";
+                    warningsDisplay.innerHTML = "<li>Network or server error. Please try again.</li>";
+                } finally {
+                    btn.disabled = false;
+                    btn.innerText = "Optimize Architecture";
                 }
             }
         </script>
     </body>
     </html>
     """
-
+ 
+ 
+# --------------------------------------------------------------------------
+# Optimization endpoint
+# --------------------------------------------------------------------------
+ 
 @app.post("/optimize")
 def optimize_endpoint(input_data: QueryInput):
-    sql_query = input_data.sql
-    parsed = sqlparse.parse(sql_query)
-    if not parsed: return {"error": "Invalid query"}
-    
-    suggestions = []
+    raw_sql = input_data.sql.strip()
+    if not raw_sql:
+        raise HTTPException(status_code=400, detail="Empty query provided.")
+ 
+    try:
+        statements = sqlparse.parse(raw_sql)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not parse SQL query.")
+ 
+    if not statements or not any(str(s).strip() for s in statements):
+        raise HTTPException(status_code=400, detail="Invalid or empty SQL query.")
+ 
+    suggestions: List[str] = []
     is_optimized = True
-    query_upper = sql_query.upper()
-    
-    # We will work on a copy of the string to progressively fix patterns
-    fixed_sql = sql_query
-
-    # Rule 1: SELECT * Detection & Fix
-    if "SELECT *" in query_upper or "SELECT  *" in query_upper:
+    fixed_sql = raw_sql
+ 
+    if len(statements) > 1:
+        suggestions.append(
+            "Multiple statements detected — only the first statement was analyzed."
+        )
+ 
+    statement = statements[0]
+    stmt_type = statement.get_type()  # e.g. SELECT, UPDATE, DELETE, UNKNOWN
+    query_upper = str(statement).upper()
+ 
+    where_clause = get_where_clause(statement)
+    from_clause = get_from_clause(statement)
+ 
+    # --- Rule 1: SELECT * -------------------------------------------------
+    if re.search(r"SELECT\s+\*", query_upper) and "COUNT(*)" not in query_upper.replace(" ", ""):
         is_optimized = False
-        suggestions.append("Anti-Pattern: 'SELECT *' wildcard detected. Forces massive payload transfers across network lines.")
-        # Auto fix placeholder rule: swap * with explicit column architecture context
-        fixed_sql = re.sub(r"SELECT\s+\*", "SELECT id, created_at, [columns...]", fixed_sql, flags=re.IGNORECASE)
-
-    # Rule 2: LOWER/UPPER functions in WHERE clause
-    bad_functions = ["LOWER(", "UPPER("]
-    for func in bad_functions:
-        if "WHERE" in query_upper and func in query_upper.split("WHERE")[1]:
+        suggestions.append(
+            "Anti-Pattern: 'SELECT *' wildcard detected. Forces the database to read and "
+            "transfer every column, even ones the application doesn't use, and prevents "
+            "covering-index optimizations."
+        )
+        fixed_sql = re.sub(
+            r"SELECT(\s+)\*",
+            r"SELECT\1/* TODO: replace * with only the columns you actually need */ *",
+            fixed_sql,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+ 
+    # --- Rule 2: LOWER()/UPPER() wrapped around a WHERE-clause column -----
+    if where_clause:
+        for func in ("LOWER(", "UPPER("):
+            if func in where_clause.upper():
+                is_optimized = False
+                suggestions.append(
+                    f"Anti-Pattern: '{func.rstrip('(')}' wraps a column inside the WHERE clause. "
+                    "This prevents the database from using a standard B-tree index on that column "
+                    "(a functional/expression index would be required instead)."
+                )
+                # Scope the fix to the WHERE clause text only, then splice it
+                # back into fixed_sql, so a same-named function used in the
+                # SELECT list is left untouched.
+                pattern = re.compile(re.escape(func[:-1]) + r"\((.*?)\)", re.IGNORECASE)
+                fixed_where = pattern.sub(r"\1", where_clause)
+                fixed_sql = fixed_sql.replace(where_clause, fixed_where, 1)
+ 
+    # --- Rule 3: legacy comma joins in FROM --------------------------------
+    if from_clause and "," in split_top_level(from_clause, ",")[0] + "," if False else False:
+        pass  # placeholder to keep linters happy; real check below
+ 
+    if from_clause:
+        top_level_tables = split_top_level(from_clause, ",")
+        if len(top_level_tables) >= 2:
             is_optimized = False
-            suggestions.append(f"Anti-Pattern: Function '{func}' wrapper utilized inside filter conditions. This breaks linear table indexes.")
-            # Auto-fix: extract column inside function to remove the performance hit
-            if func == "LOWER(":
-                fixed_sql = re.sub(r"LOWER\((.*?)\)", r"\1", fixed_sql, flags=re.IGNORECASE)
-            elif func == "UPPER(":
-                fixed_sql = re.sub(r"UPPER\((.*?)\)", r"\1", fixed_sql, flags=re.IGNORECASE)
-
-    # Rule 3: Old school Comma Joins Fix
-    if "FROM" in query_upper:
-        after_from = query_upper.split("FROM")[1]
-        from_part = after_from.split("WHERE")[0] if "WHERE" in after_from else after_from
-        
-        if "," in from_part:
-            is_optimized = False
-            suggestions.append("Anti-Pattern: Legacy table comma referencing used. Forces implicitly nested loops instead of direct structural joins.")
-            
-            # Simple RegEx extraction to turn legacy table1, table2 into explicit INNER JOIN
-            tables = [t.strip() for t in from_part.split(",")]
-            if len(tables) >= 2:
-                join_syntax = f" {tables[0]} INNER JOIN {tables[1]} ON [join_condition]"
-                # Reconstruct string
-                if "WHERE" in after_from:
-                    where_part = after_from.split("WHERE")[1]
-                    fixed_sql = fixed_sql.split("FROM")[0] + "FROM" + join_syntax + " WHERE " + where_part
-                else:
-                    fixed_sql = fixed_sql.split("FROM")[0] + "FROM" + join_syntax
-
+            suggestions.append(
+                "Anti-Pattern: legacy comma-separated table list in FROM. This creates an "
+                "implicit CROSS JOIN and relies entirely on the WHERE clause to filter the "
+                "resulting cartesian product — easy to get wrong and harder for the query "
+                "planner to optimize than an explicit JOIN."
+            )
+            join_syntax = top_level_tables[0]
+            for tbl in top_level_tables[1:]:
+                join_syntax += f" INNER JOIN {tbl} ON [join_condition]"
+            fixed_sql = fixed_sql.replace(from_clause, join_syntax, 1)
+ 
+    # --- Rule 4: leading wildcard LIKE ('%...') ---------------------------
+    if where_clause and re.search(r"LIKE\s+'%", where_clause, re.IGNORECASE):
+        is_optimized = False
+        suggestions.append(
+            "Anti-Pattern: LIKE pattern starts with a leading '%'. A leading wildcard "
+            "cannot use a standard B-tree index and forces a full table/index scan. "
+            "Consider a trailing-wildcard pattern, full-text search, or a trigram index."
+        )
+ 
+    # --- Rule 5: ORDER BY RAND()/NEWID() -----------------------------------
+    if re.search(r"ORDER BY\s+(RAND|RANDOM|NEWID)\s*\(", query_upper):
+        is_optimized = False
+        suggestions.append(
+            "Anti-Pattern: 'ORDER BY RAND()' (or equivalent) forces the database to "
+            "generate a random value for and sort every matching row before returning "
+            "any results — extremely expensive on large tables."
+        )
+ 
+    # --- Rule 6: JOIN without any ON/USING/WHERE filter (possible cartesian) --
+    if stmt_type == "SELECT" and re.search(r"\bJOIN\b", query_upper) and not where_clause \
+            and " ON " not in query_upper and " USING" not in query_upper:
+        is_optimized = False
+        suggestions.append(
+            "Warning: a JOIN was found with no ON/USING condition and no WHERE clause — "
+            "double-check this isn't producing an unintended cartesian product."
+        )
+ 
     return {
         "status": "Perfect" if is_optimized else "Needs Optimization",
         "suggestions": suggestions,
-        "fixed_sql": fixed_sql
+        "fixed_sql": fixed_sql,
     }
